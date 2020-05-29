@@ -643,6 +643,10 @@ subroutine btstep(U_in, V_in, eta_in, dt, bc_accel_u, bc_accel_v, forces, pbce, 
   integer :: isd, ied, jsd, jed, IsdB, IedB, JsdB, JedB
   integer :: ioff, joff
 
+  ! GDD: Temporary Arrays for GPU porting
+  ! naming convention: use _gpu for these temps ex: "CS_q_gpu"
+  ! None here yet
+
   if (.not.associated(CS)) call MOM_error(FATAL, &
       "btstep: Module MOM_barotropic must be initialized before it is used.")
   if (.not.CS%split) return
@@ -914,7 +918,11 @@ subroutine btstep(U_in, V_in, eta_in, dt, bc_accel_u, bc_accel_v, forces, pbce, 
   !   Use u_Cor and v_Cor as the reference values for the Coriolis terms,
   ! including the viscous remnant.
   !$OMP parallel do default(shared)
+  !GDD added OpenACC loop directive
+  !print *, "GDD 922: j=", je+1 - js-1, "i=", ie - is-1
+  !$acc parallel loop collapse(2)
   do j=js-1,je+1 ; do I=is-1,ie ; ubt_Cor(I,j) = 0.0 ; enddo ; enddo
+  !$acc end parallel
   !$OMP parallel do default(shared)
   do J=js-1,je ; do i=is-1,ie+1 ; vbt_Cor(i,J) = 0.0 ; enddo ; enddo
   !$OMP parallel do default(shared)
