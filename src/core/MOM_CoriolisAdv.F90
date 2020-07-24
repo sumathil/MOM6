@@ -16,7 +16,7 @@ use MOM_string_functions, only : uppercase
 use MOM_unit_scaling,  only : unit_scale_type
 use MOM_variables,     only : accel_diag_ptrs
 use MOM_verticalGrid,  only : verticalGrid_type
-
+use openacc
 implicit none ; private
 
 public CorAdCalc, CoriolisAdv_init, CoriolisAdv_end
@@ -210,6 +210,45 @@ subroutine CorAdCalc(u, v, h, uh, vh, CAu, CAv, OBC, AD, G, GV, US, CS)
   real :: QUHeff,QVHeff ! More temporary variables [H L2 T-1 s-1 ~> m3 s-2 or kg s-2].
   integer :: i, j, k, n, is, ie, js, je, Isq, Ieq, Jsq, Jeq, nz
 
+!_______________________Temporary Arrays for GPU porting________________________
+real, allocatable, dimension (:,:) :: G_mask2dT_gpu, G_areaT_gpu
+real, allocatable, dimension (:,:) :: G_dyCv_gpu, G_dxCu_gpu
+real, allocatable, dimension (:,:) :: G_dy_Cu_gpu, G_dx_Cv_gpu
+
+!allocate the temp variables
+allocate(G_mask2dT_gpu(size(G%mask2dT,1),size(G%mask2dT,2)))
+allocate(G_areaT_gpu(size(G%areaT,1),size(G%areaT,2)))
+allocate(G_dyCv_gpu(size(G%dyCv,1),size(G%dyCv,2)))
+allocate(G_dxCu_gpu(size(G%dxCu,1),size(G%dxCu,2)))
+allocate(G_dy_Cu_gpu(size(G%dy_Cu,1),size(G%dy_Cu,2)))
+allocate(G_dx_Cv_gpu(size(G%dx_Cv,1),size(G%dx_Cv,2)))
+
+! Copy the struct elements to temp array
+  do i=1, size(G%mask2dT, 1); do j=1, size(G%mask2dT, 2)
+    G_mask2dT_gpu(i,j) = G%mask2dT(i,j) 
+  enddo; enddo
+
+  do i=1, size(G%areaT, 1); do j=1, size(G%areaT, 2)
+    G_areaT_gpu(i,j) = G%areaT(i,j) 
+  enddo; enddo
+
+  do i=1, size(G%dyCv, 1); do j=1, size(G%dyCv, 2)
+    G_dyCv_gpu(i,j) = G%dyCv(i,j)
+  enddo; enddo
+
+  do i=1, size(G%dxCu, 1); do j=1, size(G%dxCu, 2)
+    G_dxCu_gpu(i,j) = G%dxCu(i,j)
+  enddo; enddo
+
+  do i=1, size(G%dy_Cu, 1); do j=1, size(G%dy_Cu, 2)
+    G_dy_Cu_gpu(i,j) = G%dy_Cu(i,j)
+  enddo; enddo
+
+  do i=1, size(G%dx_Cv, 1); do j=1, size(G%dx_Cv, 2)
+    G_dx_Cv_gpu(i,j) = G%dx_Cv(i,j)
+  enddo; enddo
+
+
 ! To work, the following fields must be set outside of the usual
 ! is to ie range before this subroutine is called:
 !   v(is-1:ie+2,js-1:je+1), u(is-1:ie+1,js-1:je+2), h(is-1:ie+2,js-1:je+2),
@@ -223,10 +262,17 @@ subroutine CorAdCalc(u, v, h, uh, vh, CAu, CAv, OBC, AD, G, GV, US, CS)
   eps_vel = 1.0e-10*US%m_s_to_L_T
   h_tiny = GV%Angstrom_H  ! Perhaps this should be set to h_neglect instead.
 
-  !$OMP parallel do default(private) shared(Isq,Ieq,Jsq,Jeq,G,Area_h)
+ ! !$OMP parallel do default(private) shared(Isq,Ieq,Jsq,Jeq,G,Area_h)
+ ! do j=Jsq-1,Jeq+2 ; do I=Isq-1,Ieq+2
+ !   Area_h(i,j) = G%mask2dT(i,j) * G%areaT(i,j)
+ ! enddo ; enddo
+
+!Modified for GPU execution
+!$acc parallel loop collapse(2)
   do j=Jsq-1,Jeq+2 ; do I=Isq-1,Ieq+2
-    Area_h(i,j) = G%mask2dT(i,j) * G%areaT(i,j)
+    Area_h(i,j) = G_mask2dT_gpu(i,j) * G_areaT_gpu(i,j)
   enddo ; enddo
+!$acc end parallel
   if (associated(OBC)) then ; do n=1,OBC%number_of_segments
     if (.not. OBC%segment(n)%on_pe) cycle
     I = OBC%segment(n)%HI%IsdB ; J = OBC%segment(n)%HI%JsdB
@@ -249,11 +295,12 @@ subroutine CorAdCalc(u, v, h, uh, vh, CAu, CAv, OBC, AD, G, GV, US, CS)
     endif
   enddo ; endif
   !$OMP parallel do default(private) shared(Isq,Ieq,Jsq,Jeq,G,Area_h,Area_q)
+!$acc parallel
   do J=Jsq-1,Jeq+1 ; do I=Isq-1,Ieq+1
     Area_q(i,j) = (Area_h(i,j) + Area_h(i+1,j+1)) + &
                   (Area_h(i+1,j) + Area_h(i,j+1))
   enddo ; enddo
-
+!$acc end parallel
   !$OMP parallel do default(private) shared(u,v,h,uh,vh,CAu,CAv,G,CS,AD,Area_h,Area_q,&
   !$OMP                        RV,PV,is,ie,js,je,Isq,Ieq,Jsq,Jeq,nz,h_neglect,h_tiny,OBC)
   do k=1,nz
@@ -263,28 +310,48 @@ subroutine CorAdCalc(u, v, h, uh, vh, CAu, CAv, OBC, AD, G, GV, US, CS)
     ! vorticity is second order accurate everywhere with free slip b.c.s,
     ! but only first order accurate at boundaries with no slip b.c.s.
     ! First calculate the contributions to the circulation around the q-point.
+    !do J=Jsq-1,Jeq+1 ; do I=Isq-1,Ieq+1
+    !  dvdx(I,J) = (v(i+1,J,k)*G%dyCv(i+1,J) - v(i,J,k)*G%dyCv(i,J))
+    !  dudy(I,J) = (u(I,j+1,k)*G%dxCu(I,j+1) - u(I,j,k)*G%dxCu(I,j))
+    !enddo ; enddo
+!$acc parallel
+!$acc loop collapse(2)
     do J=Jsq-1,Jeq+1 ; do I=Isq-1,Ieq+1
-      dvdx(I,J) = (v(i+1,J,k)*G%dyCv(i+1,J) - v(i,J,k)*G%dyCv(i,J))
-      dudy(I,J) = (u(I,j+1,k)*G%dxCu(I,j+1) - u(I,j,k)*G%dxCu(I,j))
+      dvdx(I,J) = (v(i+1,J,k)*G_dyCv_gpu(i+1,J) - v(i,J,k)*G_dyCv_gpu(i,J))
+      dudy(I,J) = (u(I,j+1,k)*G_dxCu_gpu(I,j+1) - u(I,j,k)*G_dxCu_gpu(I,j))
     enddo ; enddo
+!$acc loop collapse(2)
     do J=Jsq-1,Jeq+1 ; do i=Isq-1,Ieq+2
       hArea_v(i,J) = 0.5*(Area_h(i,j) * h(i,j,k) + Area_h(i,j+1) * h(i,j+1,k))
     enddo ; enddo
+!$acc loop collapse(2)
     do j=Jsq-1,Jeq+2 ; do I=Isq-1,Ieq+1
       hArea_u(I,j) = 0.5*(Area_h(i,j) * h(i,j,k) + Area_h(i+1,j) * h(i+1,j,k))
     enddo ; enddo
+!$acc end parallel
     if (CS%Coriolis_En_Dis) then
+     ! do j=Jsq,Jeq+1 ; do I=is-1,ie
+     !   uh_center(I,j) = 0.5 * (G%dy_Cu(I,j) * u(I,j,k)) * (h(i,j,k) + h(i+1,j,k))
+     ! enddo ; enddo
+     ! do J=js-1,je ; do i=Isq,Ieq+1
+     !  vh_center(i,J) = 0.5 * (G%dx_Cv(i,J) * v(i,J,k)) * (h(i,j,k) + h(i,j+1,k))
+     ! enddo ; enddo
+!$acc parallel 
+!$acc loop collapse(2)
       do j=Jsq,Jeq+1 ; do I=is-1,ie
-        uh_center(I,j) = 0.5 * (G%dy_Cu(I,j) * u(I,j,k)) * (h(i,j,k) + h(i+1,j,k))
+        uh_center(I,j) = 0.5 * (G_dy_Cu_gpu(I,j) * u(I,j,k)) * (h(i,j,k) + h(i+1,j,k))
       enddo ; enddo
+!$acc loop collapse(2)
       do J=js-1,je ; do i=Isq,Ieq+1
-        vh_center(i,J) = 0.5 * (G%dx_Cv(i,J) * v(i,J,k)) * (h(i,j,k) + h(i,j+1,k))
+        vh_center(i,J) = 0.5 * (G_dx_Cv_gpu(i,J) * v(i,J,k)) * (h(i,j,k) + h(i,j+1,k))
       enddo ; enddo
+!$acc end parallel
     endif
-
     ! Adjust circulation components to relative vorticity and thickness projected onto
     ! velocity points on open boundaries.
+print *, 'nz in k loop is',nz
     if (associated(OBC)) then ; do n=1,OBC%number_of_segments
+       print *, 'Entering if condition at line 356'
       if (.not. OBC%segment(n)%on_pe) cycle
       I = OBC%segment(n)%HI%IsdB ; J = OBC%segment(n)%HI%JsdB
       if (OBC%segment(n)%is_N_or_S .and. (J >= Jsq-1) .and. (J <= Jeq+1)) then
@@ -370,6 +437,7 @@ subroutine CorAdCalc(u, v, h, uh, vh, CAu, CAv, OBC, AD, G, GV, US, CS)
     enddo ; endif
 
     if (associated(OBC)) then ; do n=1,OBC%number_of_segments
+     print *, 'Entering if condition at 442'
       if (.not. OBC%segment(n)%on_pe) cycle
       ! Now project thicknesses across cell-corner points in the OBCs.  The two
       ! projections have to occur in sequence and can not be combined easily.
@@ -450,6 +518,7 @@ subroutine CorAdCalc(u, v, h, uh, vh, CAu, CAv, OBC, AD, G, GV, US, CS)
     ! scheme.  All are defined at u grid points.
 
     if (CS%Coriolis_Scheme == ARAKAWA_HSU90) then
+!print *, "Scheme =  ARAKAWA_HSU90"
       do j=Jsq,Jeq+1
         do I=is-1,Ieq
           a(I,j) = (q(I,J) + (q(I+1,J) + q(I,J-1))) * C1_12
@@ -461,6 +530,7 @@ subroutine CorAdCalc(u, v, h, uh, vh, CAu, CAv, OBC, AD, G, GV, US, CS)
         enddo
       enddo
     elseif (CS%Coriolis_Scheme == ARAKAWA_LAMB81) then
+!print *, 'Scheme = ARAKAWA_LAMB81'
       do j=Jsq,Jeq+1 ; do I=Isq,Ieq+1
         a(I-1,j) = (2.0*(q(I,J) + q(I-1,J-1)) + (q(I-1,J) + q(I,J-1))) * C1_24
         d(I-1,j) = ((q(I,j) + q(I-1,J-1)) + 2.0*(q(I-1,J) + q(I,J-1))) * C1_24
@@ -470,6 +540,7 @@ subroutine CorAdCalc(u, v, h, uh, vh, CAu, CAv, OBC, AD, G, GV, US, CS)
         ep_v(i,j) = (-(q(I,J) - q(I-1,J-1)) + (q(I-1,J) - q(I,J-1))) * C1_24
       enddo ; enddo
     elseif (CS%Coriolis_Scheme == AL_BLEND) then
+!print *, 'Scheme = AL_BLEND'
       Fe_m2 = CS%F_eff_max_blend - 2.0
       rat_lin = 1.5 * Fe_m2 / max(CS%wt_lin_blend, 1.0e-16)
 
@@ -515,8 +586,9 @@ subroutine CorAdCalc(u, v, h, uh, vh, CAu, CAv, OBC, AD, G, GV, US, CS)
         ep_v(i,j) = AL_wt * (-(q(I,J) - q(I-1,J-1)) + (q(I-1,J) - q(I,J-1))) * C1_24
       enddo ; enddo
     endif
-
+!Not executed 
     if (CS%Coriolis_En_Dis) then
+ !    print *,"CS%Coriolis at line 591"
     !  c1 = 1.0-1.5*RANGE ; c2 = 1.0-RANGE ; c3 = 2.0 ; slope = 0.5
       c1 = 1.0-1.5*0.5 ; c2 = 1.0-0.5 ; c3 = 2.0 ; slope = 0.5
 
@@ -571,8 +643,10 @@ subroutine CorAdCalc(u, v, h, uh, vh, CAu, CAv, OBC, AD, G, GV, US, CS)
     ! force and momentum advection.  On a Cartesian grid, this is
     !     CAu =  q * vh - d(KE)/dx.
     if (CS%Coriolis_Scheme == SADOURNY75_ENERGY) then
+!print *, 'Scheme = SADOURNY75_ENERGY'
       if (CS%Coriolis_En_Dis) then
         ! Energy dissipating biased scheme, Hallberg 200x
+!$acc parallel loop collapse(2)
         do j=js,je ; do I=Isq,Ieq
           if (q(I,J)*u(I,j,k) == 0.0) then
             temp1 = q(I,J) * ( (vh_max(i,j)+vh_max(i+1,j)) &
@@ -592,15 +666,19 @@ subroutine CorAdCalc(u, v, h, uh, vh, CAu, CAv, OBC, AD, G, GV, US, CS)
           endif
           CAu(I,j,k) = 0.25 * G%IdxCu(I,j) * (temp1 + temp2)
         enddo ; enddo
+!$acc end parallel
       else
         ! Energy conserving scheme, Sadourny 1975
+!$acc parallel loop collapse(2)
         do j=js,je ; do I=Isq,Ieq
           CAu(I,j,k) = 0.25 * &
             (q(I,J) * (vh(i+1,J,k) + vh(i,J,k)) + &
              q(I,J-1) * (vh(i,J-1,k) + vh(i+1,J-1,k))) * G%IdxCu(I,j)
         enddo ; enddo
+!$acc end parallel
       endif
     elseif (CS%Coriolis_Scheme == SADOURNY75_ENSTRO) then
+print *, 'Scheme = SADOURNY75_ENSTRO'
       do j=js,je ; do I=Isq,Ieq
         CAu(I,j,k) = 0.125 * (G%IdxCu(I,j) * (q(I,J) + q(I,J-1))) * &
                      ((vh(i+1,J,k) + vh(i,J,k)) + (vh(i,J-1,k) + vh(i+1,J-1,k)))
@@ -614,6 +692,7 @@ subroutine CorAdCalc(u, v, h, uh, vh, CAu, CAv, OBC, AD, G, GV, US, CS)
                       (b(I,j) * vh(i,J,k) +  d(I,j) * vh(i+1,J-1,k))) * G%IdxCu(I,j)
       enddo ; enddo
     elseif (CS%Coriolis_Scheme == ROBUST_ENSTRO) then
+print *, 'Scheme = ROBUST_ENSTRO'
       ! An enstrophy conserving scheme robust to vanishing layers
       ! Note: Heffs are in lieu of h_at_v that should be returned by the
       !       continuity solver. AJA
@@ -651,6 +730,7 @@ subroutine CorAdCalc(u, v, h, uh, vh, CAu, CAv, OBC, AD, G, GV, US, CS)
 
 
     if (CS%bound_Coriolis) then
+!$acc parallel loop collapse(2)
       do j=js,je ; do I=Isq,Ieq
         max_fv = MAX(max_fvq(I,J), max_fvq(I,J-1))
         min_fv = MIN(min_fvq(I,J), min_fvq(I,J-1))
@@ -662,14 +742,16 @@ subroutine CorAdCalc(u, v, h, uh, vh, CAu, CAv, OBC, AD, G, GV, US, CS)
           if (CAu(I,j,k) < min_fv) CAu(I,j,k) = min_fv
         endif
       enddo ; enddo
+!$acc end parallel 
     endif
 
     ! Term - d(KE)/dx.
+!$acc parallel loop collapse(2)
     do j=js,je ; do I=Isq,Ieq
       CAu(I,j,k) = CAu(I,j,k) - KEx(I,j)
       if (associated(AD%gradKEu)) AD%gradKEu(I,j,k) = -KEx(I,j)
     enddo ; enddo
-
+!$acc end parallel
 
     ! Calculate the tendencies of meridional velocity due to the Coriolis
     ! force and momentum advection.  On a Cartesian grid, this is
@@ -677,6 +759,7 @@ subroutine CorAdCalc(u, v, h, uh, vh, CAu, CAv, OBC, AD, G, GV, US, CS)
     if (CS%Coriolis_Scheme == SADOURNY75_ENERGY) then
       if (CS%Coriolis_En_Dis) then
         ! Energy dissipating biased scheme, Hallberg 200x
+!$acc parallel loop collapse(2)
         do J=Jsq,Jeq ; do i=is,ie
           if (q(I-1,J)*v(i,J,k) == 0.0) then
             temp1 = q(I-1,J) * ( (uh_max(i-1,j)+uh_max(i-1,j+1)) &
@@ -696,13 +779,16 @@ subroutine CorAdCalc(u, v, h, uh, vh, CAu, CAv, OBC, AD, G, GV, US, CS)
           endif
           CAv(i,J,k) = -0.25 * G%IdyCv(i,J) * (temp1 + temp2)
         enddo ; enddo
+!$acc end parallel
       else
         ! Energy conserving scheme, Sadourny 1975
+!$acc parallel loop collapse(2)
         do J=Jsq,Jeq ; do i=is,ie
           CAv(i,J,k) = - 0.25* &
               (q(I-1,J)*(uh(I-1,j,k) + uh(I-1,j+1,k)) + &
                q(I,J)*(uh(I,j,k) + uh(I,j+1,k))) * G%IdyCv(i,J)
         enddo ; enddo
+!$acc end parallel
       endif
     elseif (CS%Coriolis_Scheme == SADOURNY75_ENSTRO) then
       do J=Jsq,Jeq ; do i=is,ie
@@ -759,6 +845,8 @@ subroutine CorAdCalc(u, v, h, uh, vh, CAu, CAv, OBC, AD, G, GV, US, CS)
     enddo ; enddo ; endif
 
     if (CS%bound_Coriolis) then
+!print *,"IF condition at 848"
+!$acc parallel
       do J=Jsq,Jeq ; do i=is,ie
         max_fu = MAX(max_fuq(I,J),max_fuq(I-1,J))
         min_fu = MIN(min_fuq(I,J),min_fuq(I-1,J))
@@ -768,18 +856,22 @@ subroutine CorAdCalc(u, v, h, uh, vh, CAu, CAv, OBC, AD, G, GV, US, CS)
           if (CAv(i,J,k) < min_fu) CAv(i,J,k) = min_fu
         endif
       enddo ; enddo
+!$acc end parallel
     endif
 
     ! Term - d(KE)/dy.
+!$acc parallel loop collapse(2)
     do J=Jsq,Jeq ; do i=is,ie
       CAv(i,J,k) = CAv(i,J,k) - KEy(i,J)
       if (associated(AD%gradKEv)) AD%gradKEv(i,J,k) = -KEy(i,J)
     enddo ; enddo
+!$acc end parallel
 
     if (associated(AD%rv_x_u) .or. associated(AD%rv_x_v)) then
       ! Calculate the Coriolis-like acceleration due to relative vorticity.
       if (CS%Coriolis_Scheme == SADOURNY75_ENERGY) then
         if (associated(AD%rv_x_u)) then
+print *,"If condition at line 872"
           do J=Jsq,Jeq ; do i=is,ie
             AD%rv_x_u(i,J,k) = - 0.25* &
               (q2(I-1,j)*(uh(I-1,j,k) + uh(I-1,j+1,k)) + &
