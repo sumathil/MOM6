@@ -17,6 +17,8 @@ use MOM_unit_scaling,  only : unit_scale_type
 use MOM_variables,     only : accel_diag_ptrs
 use MOM_verticalGrid,  only : verticalGrid_type
 use openacc
+
+use MOM_cpu_clock, only : cpu_clock_id, cpu_clock_begin, cpu_clock_end, CLOCK_MODULE
 implicit none ; private
 
 public CorAdCalc, CoriolisAdv_init, CoriolisAdv_end
@@ -209,7 +211,7 @@ subroutine CorAdCalc(u, v, h, uh, vh, CAu, CAv, OBC, AD, G, GV, US, CS)
   real :: UHeff, VHeff  ! More temporary variables [H L2 T-1 ~> m3 s-1 or kg s-1].
   real :: QUHeff,QVHeff ! More temporary variables [H L2 T-1 s-1 ~> m3 s-2 or kg s-2].
   integer :: i, j, k, n, is, ie, js, je, Isq, Ieq, Jsq, Jeq, nz
-
+  integer :: my_clock_id
 !_______________________Temporary Arrays for GPU porting________________________
 real, allocatable, dimension (:,:) :: G_mask2dT_gpu, G_areaT_gpu
 real, allocatable, dimension (:,:) :: G_dyCv_gpu, G_dxCu_gpu
@@ -267,12 +269,16 @@ allocate(G_dx_Cv_gpu(size(G%dx_Cv,1),size(G%dx_Cv,2)))
  !   Area_h(i,j) = G%mask2dT(i,j) * G%areaT(i,j)
  ! enddo ; enddo
 
+my_clock_id = cpu_clock_id("Parallel loop at 272", grain=CLOCK_MODULE)
 !Modified for GPU execution
+call cpu_clock_begin(my_clock_id)
 !$acc parallel loop collapse(2)
   do j=Jsq-1,Jeq+2 ; do I=Isq-1,Ieq+2
     Area_h(i,j) = G_mask2dT_gpu(i,j) * G_areaT_gpu(i,j)
   enddo ; enddo
 !$acc end parallel
+call cpu_clock_end(my_clock_id)
+
   if (associated(OBC)) then ; do n=1,OBC%number_of_segments
     if (.not. OBC%segment(n)%on_pe) cycle
     I = OBC%segment(n)%HI%IsdB ; J = OBC%segment(n)%HI%JsdB
@@ -295,12 +301,15 @@ allocate(G_dx_Cv_gpu(size(G%dx_Cv,1),size(G%dx_Cv,2)))
     endif
   enddo ; endif
   !$OMP parallel do default(private) shared(Isq,Ieq,Jsq,Jeq,G,Area_h,Area_q)
-!$acc parallel
+my_clock_id = cpu_clock_id("Parallel loop at 304", grain=CLOCK_MODULE)
+call cpu_clock_begin(my_clock_id)
+!$acc parallel loop 
   do J=Jsq-1,Jeq+1 ; do I=Isq-1,Ieq+1
     Area_q(i,j) = (Area_h(i,j) + Area_h(i+1,j+1)) + &
                   (Area_h(i+1,j) + Area_h(i,j+1))
   enddo ; enddo
 !$acc end parallel
+call cpu_clock_end(my_clock_id)
   !$OMP parallel do default(private) shared(u,v,h,uh,vh,CAu,CAv,G,CS,AD,Area_h,Area_q,&
   !$OMP                        RV,PV,is,ie,js,je,Isq,Ieq,Jsq,Jeq,nz,h_neglect,h_tiny,OBC)
   do k=1,nz
@@ -314,6 +323,8 @@ allocate(G_dx_Cv_gpu(size(G%dx_Cv,1),size(G%dx_Cv,2)))
     !  dvdx(I,J) = (v(i+1,J,k)*G%dyCv(i+1,J) - v(i,J,k)*G%dyCv(i,J))
     !  dudy(I,J) = (u(I,j+1,k)*G%dxCu(I,j+1) - u(I,j,k)*G%dxCu(I,j))
     !enddo ; enddo
+my_clock_id = cpu_clock_id("Parallel loop at 326", grain=CLOCK_MODULE)
+call cpu_clock_begin(my_clock_id)
 !$acc parallel
 !$acc loop collapse(2)
     do J=Jsq-1,Jeq+1 ; do I=Isq-1,Ieq+1
@@ -329,6 +340,7 @@ allocate(G_dx_Cv_gpu(size(G%dx_Cv,1),size(G%dx_Cv,2)))
       hArea_u(I,j) = 0.5*(Area_h(i,j) * h(i,j,k) + Area_h(i+1,j) * h(i+1,j,k))
     enddo ; enddo
 !$acc end parallel
+call cpu_clock_end(my_clock_id)
     if (CS%Coriolis_En_Dis) then
      ! do j=Jsq,Jeq+1 ; do I=is-1,ie
      !   uh_center(I,j) = 0.5 * (G%dy_Cu(I,j) * u(I,j,k)) * (h(i,j,k) + h(i+1,j,k))
@@ -336,6 +348,8 @@ allocate(G_dx_Cv_gpu(size(G%dx_Cv,1),size(G%dx_Cv,2)))
      ! do J=js-1,je ; do i=Isq,Ieq+1
      !  vh_center(i,J) = 0.5 * (G%dx_Cv(i,J) * v(i,J,k)) * (h(i,j,k) + h(i,j+1,k))
      ! enddo ; enddo
+my_clock_id = cpu_clock_id("Parallel loop at 351", grain=CLOCK_MODULE)
+call cpu_clock_begin(my_clock_id)
 !$acc parallel 
 !$acc loop collapse(2)
       do j=Jsq,Jeq+1 ; do I=is-1,ie
@@ -346,12 +360,11 @@ allocate(G_dx_Cv_gpu(size(G%dx_Cv,1),size(G%dx_Cv,2)))
         vh_center(i,J) = 0.5 * (G_dx_Cv_gpu(i,J) * v(i,J,k)) * (h(i,j,k) + h(i,j+1,k))
       enddo ; enddo
 !$acc end parallel
+call cpu_clock_end(my_clock_id)
     endif
     ! Adjust circulation components to relative vorticity and thickness projected onto
     ! velocity points on open boundaries.
-print *, 'nz in k loop is',nz
     if (associated(OBC)) then ; do n=1,OBC%number_of_segments
-       print *, 'Entering if condition at line 356'
       if (.not. OBC%segment(n)%on_pe) cycle
       I = OBC%segment(n)%HI%IsdB ; J = OBC%segment(n)%HI%JsdB
       if (OBC%segment(n)%is_N_or_S .and. (J >= Jsq-1) .and. (J <= Jeq+1)) then
@@ -437,7 +450,6 @@ print *, 'nz in k loop is',nz
     enddo ; endif
 
     if (associated(OBC)) then ; do n=1,OBC%number_of_segments
-     print *, 'Entering if condition at 442'
       if (.not. OBC%segment(n)%on_pe) cycle
       ! Now project thicknesses across cell-corner points in the OBCs.  The two
       ! projections have to occur in sequence and can not be combined easily.
@@ -473,7 +485,9 @@ print *, 'nz in k loop is',nz
         enddo
       endif
     enddo ; endif
-
+my_clock_id = cpu_clock_id("Parallel loop at 488", grain=CLOCK_MODULE)
+call cpu_clock_begin(my_clock_id)
+!$acc parallel loop collapse(2)
     do J=Jsq-1,Jeq+1 ; do I=Isq-1,Ieq+1
       if (CS%no_slip ) then
         relative_vorticity = (2.0-G%mask2dBu(I,J)) * (dvdx(I,J) - dudy(I,J)) * G%IareaBu(I,J)
@@ -512,13 +526,13 @@ print *, 'nz in k loop is',nz
       if (associated(AD%rv_x_v) .or. associated(AD%rv_x_u)) &
         q2(I,J) = relative_vorticity * Ih
     enddo ; enddo
-
+!$acc end parallel
+call cpu_clock_end(my_clock_id)
     !   a, b, c, and d are combinations of neighboring potential
     ! vorticities which form the Arakawa and Hsu vorticity advection
     ! scheme.  All are defined at u grid points.
 
     if (CS%Coriolis_Scheme == ARAKAWA_HSU90) then
-!print *, "Scheme =  ARAKAWA_HSU90"
       do j=Jsq,Jeq+1
         do I=is-1,Ieq
           a(I,j) = (q(I,J) + (q(I+1,J) + q(I,J-1))) * C1_12
@@ -530,7 +544,6 @@ print *, 'nz in k loop is',nz
         enddo
       enddo
     elseif (CS%Coriolis_Scheme == ARAKAWA_LAMB81) then
-!print *, 'Scheme = ARAKAWA_LAMB81'
       do j=Jsq,Jeq+1 ; do I=Isq,Ieq+1
         a(I-1,j) = (2.0*(q(I,J) + q(I-1,J-1)) + (q(I-1,J) + q(I,J-1))) * C1_24
         d(I-1,j) = ((q(I,j) + q(I-1,J-1)) + 2.0*(q(I-1,J) + q(I,J-1))) * C1_24
@@ -540,7 +553,6 @@ print *, 'nz in k loop is',nz
         ep_v(i,j) = (-(q(I,J) - q(I-1,J-1)) + (q(I-1,J) - q(I,J-1))) * C1_24
       enddo ; enddo
     elseif (CS%Coriolis_Scheme == AL_BLEND) then
-!print *, 'Scheme = AL_BLEND'
       Fe_m2 = CS%F_eff_max_blend - 2.0
       rat_lin = 1.5 * Fe_m2 / max(CS%wt_lin_blend, 1.0e-16)
 
@@ -586,12 +598,14 @@ print *, 'nz in k loop is',nz
         ep_v(i,j) = AL_wt * (-(q(I,J) - q(I-1,J-1)) + (q(I-1,J) - q(I,J-1))) * C1_24
       enddo ; enddo
     endif
-!Not executed 
+
     if (CS%Coriolis_En_Dis) then
- !    print *,"CS%Coriolis at line 591"
     !  c1 = 1.0-1.5*RANGE ; c2 = 1.0-RANGE ; c3 = 2.0 ; slope = 0.5
       c1 = 1.0-1.5*0.5 ; c2 = 1.0-0.5 ; c3 = 2.0 ; slope = 0.5
-
+my_clock_id = cpu_clock_id("Parallel loop at 602", grain=CLOCK_MODULE)
+call cpu_clock_begin(my_clock_id)
+!$acc parallel 
+!$acc loop collapse(2)
       do j=Jsq,Jeq+1 ; do I=is-1,ie
         uhc = uh_center(I,j)
         uhm = uh(I,j,k)
@@ -613,6 +627,7 @@ print *, 'nz in k loop is',nz
           uh_max(I,j) = uhm ; uh_min(I,j) = uhc
         endif
       enddo ; enddo
+!$acc loop collapse(2)
       do J=js-1,je ; do i=Isq,Ieq+1
         vhc = vh_center(i,J)
         vhm = vh(i,J,k)
@@ -634,6 +649,8 @@ print *, 'nz in k loop is',nz
           vh_max(i,J) = vhm ; vh_min(i,J) = vhc
         endif
       enddo ; enddo
+!$acc end parallel
+call cpu_clock_end(my_clock_id)
     endif
 
     ! Calculate KE and the gradient of KE
@@ -643,9 +660,10 @@ print *, 'nz in k loop is',nz
     ! force and momentum advection.  On a Cartesian grid, this is
     !     CAu =  q * vh - d(KE)/dx.
     if (CS%Coriolis_Scheme == SADOURNY75_ENERGY) then
-!print *, 'Scheme = SADOURNY75_ENERGY'
       if (CS%Coriolis_En_Dis) then
         ! Energy dissipating biased scheme, Hallberg 200x
+my_clock_id = cpu_clock_id("Parallel loop at 656", grain=CLOCK_MODULE)
+call cpu_clock_begin(my_clock_id)
 !$acc parallel loop collapse(2)
         do j=js,je ; do I=Isq,Ieq
           if (q(I,J)*u(I,j,k) == 0.0) then
@@ -667,8 +685,11 @@ print *, 'nz in k loop is',nz
           CAu(I,j,k) = 0.25 * G%IdxCu(I,j) * (temp1 + temp2)
         enddo ; enddo
 !$acc end parallel
+call cpu_clock_end(my_clock_id)
       else
         ! Energy conserving scheme, Sadourny 1975
+my_clock_id = cpu_clock_id("Parallel loop at 682", grain=CLOCK_MODULE)
+call cpu_clock_begin(my_clock_id)
 !$acc parallel loop collapse(2)
         do j=js,je ; do I=Isq,Ieq
           CAu(I,j,k) = 0.25 * &
@@ -676,9 +697,9 @@ print *, 'nz in k loop is',nz
              q(I,J-1) * (vh(i,J-1,k) + vh(i+1,J-1,k))) * G%IdxCu(I,j)
         enddo ; enddo
 !$acc end parallel
+call cpu_clock_end(my_clock_id)
       endif
     elseif (CS%Coriolis_Scheme == SADOURNY75_ENSTRO) then
-print *, 'Scheme = SADOURNY75_ENSTRO'
       do j=js,je ; do I=Isq,Ieq
         CAu(I,j,k) = 0.125 * (G%IdxCu(I,j) * (q(I,J) + q(I,J-1))) * &
                      ((vh(i+1,J,k) + vh(i,J,k)) + (vh(i,J-1,k) + vh(i+1,J-1,k)))
@@ -692,7 +713,6 @@ print *, 'Scheme = SADOURNY75_ENSTRO'
                       (b(I,j) * vh(i,J,k) +  d(I,j) * vh(i+1,J-1,k))) * G%IdxCu(I,j)
       enddo ; enddo
     elseif (CS%Coriolis_Scheme == ROBUST_ENSTRO) then
-print *, 'Scheme = ROBUST_ENSTRO'
       ! An enstrophy conserving scheme robust to vanishing layers
       ! Note: Heffs are in lieu of h_at_v that should be returned by the
       !       continuity solver. AJA
@@ -730,6 +750,8 @@ print *, 'Scheme = ROBUST_ENSTRO'
 
 
     if (CS%bound_Coriolis) then
+my_clock_id = cpu_clock_id("Parallel loop at 744", grain=CLOCK_MODULE)
+call cpu_clock_begin(my_clock_id)
 !$acc parallel loop collapse(2)
       do j=js,je ; do I=Isq,Ieq
         max_fv = MAX(max_fvq(I,J), max_fvq(I,J-1))
@@ -743,22 +765,27 @@ print *, 'Scheme = ROBUST_ENSTRO'
         endif
       enddo ; enddo
 !$acc end parallel 
+call cpu_clock_end(my_clock_id)
     endif
 
-    ! Term - d(KE)/dx.
+    ! Term - d(KE)/dx
+my_clock_id = cpu_clock_id("Parallel loop at 763", grain=CLOCK_MODULE)
+call cpu_clock_begin(my_clock_id)
 !$acc parallel loop collapse(2)
     do j=js,je ; do I=Isq,Ieq
       CAu(I,j,k) = CAu(I,j,k) - KEx(I,j)
       if (associated(AD%gradKEu)) AD%gradKEu(I,j,k) = -KEx(I,j)
     enddo ; enddo
 !$acc end parallel
-
+call cpu_clock_end(my_clock_id)
     ! Calculate the tendencies of meridional velocity due to the Coriolis
     ! force and momentum advection.  On a Cartesian grid, this is
     !     CAv = - q * uh - d(KE)/dy.
     if (CS%Coriolis_Scheme == SADOURNY75_ENERGY) then
       if (CS%Coriolis_En_Dis) then
         ! Energy dissipating biased scheme, Hallberg 200x
+my_clock_id = cpu_clock_id("Parallel loop at 778", grain=CLOCK_MODULE)
+call cpu_clock_begin(my_clock_id)
 !$acc parallel loop collapse(2)
         do J=Jsq,Jeq ; do i=is,ie
           if (q(I-1,J)*v(i,J,k) == 0.0) then
@@ -780,8 +807,11 @@ print *, 'Scheme = ROBUST_ENSTRO'
           CAv(i,J,k) = -0.25 * G%IdyCv(i,J) * (temp1 + temp2)
         enddo ; enddo
 !$acc end parallel
+call cpu_clock_end(my_clock_id)
       else
         ! Energy conserving scheme, Sadourny 1975
+my_clock_id = cpu_clock_id("Parallel loop at 804", grain=CLOCK_MODULE)
+call cpu_clock_begin(my_clock_id)
 !$acc parallel loop collapse(2)
         do J=Jsq,Jeq ; do i=is,ie
           CAv(i,J,k) = - 0.25* &
@@ -789,6 +819,7 @@ print *, 'Scheme = ROBUST_ENSTRO'
                q(I,J)*(uh(I,j,k) + uh(I,j+1,k))) * G%IdyCv(i,J)
         enddo ; enddo
 !$acc end parallel
+call cpu_clock_end(my_clock_id)
       endif
     elseif (CS%Coriolis_Scheme == SADOURNY75_ENSTRO) then
       do J=Jsq,Jeq ; do i=is,ie
@@ -845,8 +876,9 @@ print *, 'Scheme = ROBUST_ENSTRO'
     enddo ; enddo ; endif
 
     if (CS%bound_Coriolis) then
-!print *,"IF condition at 848"
-!$acc parallel
+my_clock_id = cpu_clock_id("Parallel loop at 870", grain=CLOCK_MODULE)
+call cpu_clock_begin(my_clock_id)
+!$acc parallel loop collapse(2)
       do J=Jsq,Jeq ; do i=is,ie
         max_fu = MAX(max_fuq(I,J),max_fuq(I-1,J))
         min_fu = MIN(min_fuq(I,J),min_fuq(I-1,J))
@@ -857,21 +889,23 @@ print *, 'Scheme = ROBUST_ENSTRO'
         endif
       enddo ; enddo
 !$acc end parallel
+call cpu_clock_end(my_clock_id)
     endif
 
     ! Term - d(KE)/dy.
+my_clock_id = cpu_clock_id("Parallel loop at 887", grain=CLOCK_MODULE)
+call cpu_clock_begin(my_clock_id)
 !$acc parallel loop collapse(2)
     do J=Jsq,Jeq ; do i=is,ie
       CAv(i,J,k) = CAv(i,J,k) - KEy(i,J)
       if (associated(AD%gradKEv)) AD%gradKEv(i,J,k) = -KEy(i,J)
     enddo ; enddo
 !$acc end parallel
-
+call cpu_clock_end(my_clock_id)
     if (associated(AD%rv_x_u) .or. associated(AD%rv_x_v)) then
       ! Calculate the Coriolis-like acceleration due to relative vorticity.
       if (CS%Coriolis_Scheme == SADOURNY75_ENERGY) then
         if (associated(AD%rv_x_u)) then
-print *,"If condition at line 872"
           do J=Jsq,Jeq ; do i=is,ie
             AD%rv_x_u(i,J,k) = - 0.25* &
               (q2(I-1,j)*(uh(I-1,j,k) + uh(I-1,j+1,k)) + &
@@ -944,7 +978,7 @@ subroutine gradKE(u, v, h, KE, KEx, KEy, k, OBC, G, US, CS)
   real :: um2, up2, vm2, vp2     ! Temporary variables [L2 T-2 ~> m2 s-2].
   real :: um2a, up2a, vm2a, vp2a ! Temporary variables [L4 T-2 ~> m4 s-2].
   integer :: i, j, is, ie, js, je, Isq, Ieq, Jsq, Jeq, nz, n
-
+  integer :: my_clock_id
   is = G%isc ; ie = G%iec ; js = G%jsc ; je = G%jec ; nz = G%ke
   Isq = G%IscB ; Ieq = G%IecB ; Jsq = G%JscB ; Jeq = G%JecB
 
@@ -954,12 +988,17 @@ subroutine gradKE(u, v, h, KE, KEx, KEy, k, OBC, G, US, CS)
     ! The following calculation of Kinetic energy includes the metric terms
     ! identified in Arakawa & Lamb 1982 as important for KE conservation.  It
     ! also includes the possibility of partially-blocked tracer cell faces.
+my_clock_id = cpu_clock_id("Parallel loop at 992", grain=CLOCK_MODULE)
+call cpu_clock_begin(my_clock_id)
+!$acc parallel loop collapse(2)
     do j=Jsq,Jeq+1 ; do i=Isq,Ieq+1
       KE(i,j) = ( ( G%areaCu( I ,j)*(u( I ,j,k)*u( I ,j,k)) + &
                     G%areaCu(I-1,j)*(u(I-1,j,k)*u(I-1,j,k)) ) + &
                   ( G%areaCv(i, J )*(v(i, J ,k)*v(i, J ,k)) + &
                     G%areaCv(i,J-1)*(v(i,J-1,k)*v(i,J-1,k)) ) )*0.25*G%IareaT(i,j)
     enddo ; enddo
+!$acc end parallel
+call cpu_clock_end(my_clock_id)
   elseif (CS%KE_Scheme == KE_SIMPLE_GUDONOV) then
     ! The following discretization of KE is based on the one-dimensinal Gudonov
     ! scheme which does not take into account any geometric factors
@@ -983,15 +1022,21 @@ subroutine gradKE(u, v, h, KE, KEx, KEy, k, OBC, G, US, CS)
   endif
 
   ! Term - d(KE)/dx.
+my_clock_id = cpu_clock_id("Parallel loop at 992", grain=CLOCK_MODULE)
+call cpu_clock_begin(my_clock_id)
+!$acc parallel
+!$acc loop collapse(2)
   do j=js,je ; do I=Isq,Ieq
     KEx(I,j) = (KE(i+1,j) - KE(i,j)) * G%IdxCu(I,j)
   enddo ; enddo
 
   ! Term - d(KE)/dy.
+!$acc loop collapse(2)
   do J=Jsq,Jeq ; do i=is,ie
     KEy(i,J) = (KE(i,j+1) - KE(i,j)) * G%IdyCv(i,J)
   enddo ; enddo
-
+!$acc end parallel
+call cpu_clock_end(my_clock_id)
   if (associated(OBC)) then
     do n=1,OBC%number_of_segments
       if (OBC%segment(n)%is_N_or_S) then
